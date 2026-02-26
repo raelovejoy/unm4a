@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.1.0"
+
+usage() {
+  cat <<'EOF'
+unm4a - extract FLAC-in-M4A into .flac (no re-encode), preserving attached cover art.
+
+Usage:
+  unm4a [options] [path ...]
+
+If no path is given, uses the current directory.
+Paths can be directories or .m4a files.
+
+Options:
+  -r, --recursive       Recurse into subdirectories
+  -o, --outdir DIR      Output directory (default: fixed_flac). Ignored with --inplace
+  -i, --inplace         Write .flac next to source files (no fixed folder)
+      --remove-src      Remove source .m4a after successful conversion (use with care)
+  -n, --dry-run         Print what would happen without writing files
+  -v, --verbose         Print extra info (codecs, skipped reasons)
+  -h, --help            Show this help
+      --version         Print version
+
+Behavior:
+  - Only converts files where the first audio stream codec is 'flac'.
+  - Skips AAC/ALAC/etc.
+  - Copies audio and embedded artwork without re-encoding.
+
+Dependencies:
+  ffmpeg, ffprobe
+
+Examples:
+  unm4a
+  unm4a -r ~/Music/Albums
+  unm4a -o repaired_flac .
+  unm4a --inplace --remove-src "Album Dir"
+EOF
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Error: missing dependency '$1'." >&2
+    exit 1
+  }
+}
+
+log() { echo "$*"; }
+vlog() { if [[ "${VERBOSE:-0}" == "1" ]]; then echo "$*"; fi }
+
+DRY_RUN=0
+VERBOSE=0
+RECURSIVE=0
+INPLACE=0
+REMOVE_SRC=0
+OUTDIR="fixed_flac"
+
+ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -r|--recursive) RECURSIVE=1; shift ;;
+    -o|--outdir) OUTDIR="${2:-}"; shift 2 ;;
+    -i|--inplace) INPLACE=1; shift ;;
+    --remove-src) REMOVE_SRC=1; shift ;;
+    -n|--dry-run) DRY_RUN=1; shift ;;
+    -v|--verbose) VERBOSE=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --version) echo "unm4a $VERSION"; exit 0 ;;
+    --) shift; break ;;
+    -*) echo "Unknown option: $1" >&2; usage; exit 2 ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+
+# Remaining args after --
+while [[ $# -gt 0 ]]; do ARGS+=("$1"); shift; done
+
+need_cmd ffmpeg
+need_cmd ffprobe
+
+if [[ ${#ARGS[@]} -eq 0 ]]; then
+  ARGS=(".")
+fi
+
+if [[ "$INPLACE" == "1" && "$OUTDIR" != "fixed_flac" ]]; then
+  vlog "Note: --outdir is ignored when --inplace is set."
+fi
+
+# Build list of .m4a files to process
+FILES=()
+
+add_file() {
+  local f="$1"
+  # only accept existing regular files ending with .m4a (case-insensitive)
+  if [[ -f "$f" && "${f,,}" == *.m4a ]]; then
+    FILES+=("$f")
+  fi
+}
+
+process_path() {
+  local p="$1"
+  if [[ -f "$p" ]]; then
+    add_file "$p"
+    return
+  fi
+  if [[ -d "$p" ]]; then
+    if [[ "$RECURSIVE" == "1" ]]; then
+      while IFS= read -r -d '' f; do
+        FILES+=("$f")
+      done < <(find "$p" -type f \( -iname "*.m4a" \) -print0)
+    else
+      shopt -s nullglob
+      local f
+      for f in "$p"/*.m4a "$p"/*.M4A; do
+        add_file "$f"
+      done
+      shopt -u nullglob
+    fi
+    return
+  fi
+  vlog "Skipping (not found): $p"
+}
+
+for p in "${ARGS[@]}"; do
+  process_path "$p"
+done
+
+if [[ ${#FILES[@]} -eq 0 ]]; then
+  echo "No .m4a files found." >&2
+  exit 1
+fi
+
+convert_one() {
+  local src="$1"
+  local dir base codec outdir dst tmpdst
+
+  dir="$(dirname "$src")"
+  base="$(basename "$src")"
+  base="${base%.*}"
+
+  codec="$(ffprobe -v error -select_streams a:0 \
+    -show_entries stream=codec_name \
+    -of default=noprint_wrappers=1:nokey=1 "$src" || true)"
+
+  if [[ "$codec" != "flac" ]]; then
+    vlog "Skipping (audio codec is '$codec', not flac): $src"
+    return 0
+  fi
+
+  if [[ "$INPLACE" == "1" ]]; then
+    outdir="$dir"
+  else
+    outdir="$dir/$OUTDIR"
+  fi
+
+  dst="$outdir/$base.flac"
+  tmpdst="$dst.unm4a_tmp"
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    log "Would convert: $src -> $dst"
+    if [[ "$REMOVE_SRC" == "1" ]]; then
+      log "Would remove source: $src"
+    fi
+    return 0
+  fi
+
+  mkdir -p "$outdir"
+
+  # Avoid clobbering existing output
+  if [[ -e "$dst" ]]; then
+    vlog "Skipping (output exists): $dst"
+    return 0
+  fi
+
+  log "Converting: $src"
+  ffmpeg -hide_banner -loglevel error -i "$src" \
+    -map 0:a:0 -c:a copy \
+    -map 0:v:0 -c:v copy -disposition:v attached_pic \
+    "$tmpdst"
+
+  mv -f "$tmpdst" "$dst"
+
+  if [[ "$REMOVE_SRC" == "1" ]]; then
+    rm -f "$src"
+    vlog "Removed: $src"
+  fi
+
+  return 0
+}
+
+failures=0
+for f in "${FILES[@]}"; do
+  if ! convert_one "$f"; then
+    echo "Failed: $f" >&2
+    failures=$((failures + 1))
+  fi
+done
+
+if [[ "$failures" -gt 0 ]]; then
+  echo "Done with $failures failure(s)." >&2
+  exit 1
+fi
+
+log "Done."
